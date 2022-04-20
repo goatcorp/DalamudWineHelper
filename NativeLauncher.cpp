@@ -6,183 +6,229 @@
 #include <AclAPI.h>
 #include <iomanip>
 #include <sstream>
+#include <lmcons.h>
+#include <vector>
 
 using namespace std;
 
-bool disable_debug_privilege()
-{
-   HANDLE hToken = NULL;
-   LUID luidDebugPrivilege;
-   PRIVILEGE_SET RequiredPrivileges;
-   BOOL bResult;
+void append_quoted_argv(const std::wstring& arg, std::wstring& cmdline, bool force_escape = false);
 
-   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken))
-   {
-      std::cout << "OpenProcessToken failed: " << GetLastError() << std::endl;
-      return false;
-   }
+bool disable_debug_privilege() {
+	HANDLE hToken = NULL;
+	LUID luid_debug{};
+	PRIVILEGE_SET required_privileges{};
+	TOKEN_PRIVILEGES token_privileges{};
+	BOOL res = false;
 
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+		std::cerr << "OpenProcessToken failed: " << GetLastError() << std::endl;
+		goto cleanup;
+	}
 
-   if (!LookupPrivilegeValue(NULL, L"SeDebugPrivilege", &luidDebugPrivilege))
-   {
-      std::cout << "LookupPrivilegeValue failed: " << GetLastError() << std::endl;
-      return false;
-   }
+	if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid_debug)) {
+		std::cerr << "LookupPrivilegeValue failed: " << GetLastError() << std::endl;
+		goto cleanup;
+	}
 
+	required_privileges.PrivilegeCount = 1;
+	required_privileges.Control = PRIVILEGE_SET_ALL_NECESSARY;
 
-   RequiredPrivileges.PrivilegeCount = 1;
-   RequiredPrivileges.Control = PRIVILEGE_SET_ALL_NECESSARY;
+	required_privileges.Privilege[0].Luid = luid_debug;
+	required_privileges.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-   RequiredPrivileges.Privilege[0].Luid = luidDebugPrivilege;
-   RequiredPrivileges.Privilege[0].Attributes = SE_PRIVILEGE_ENABLED;
+	if (!PrivilegeCheck(hToken, &required_privileges, &res)) {
+		std::cerr << "PrivilegeCheck failed: " << GetLastError() << std::endl;
+		goto cleanup;
+	}
 
-   PrivilegeCheck(hToken, &RequiredPrivileges, &bResult);
+	if (!res) {
+		// SeDebugPrivilege is disabled; for our purposes this counts as already done
+		res = true;
+		goto cleanup;
+	}
 
-   if (bResult) // SeDebugPrivilege is enabled; try disabling it
-   {
-      TOKEN_PRIVILEGES TokenPrivileges;
-      TokenPrivileges.PrivilegeCount = 1;
-      TokenPrivileges.Privileges[0].Luid = luidDebugPrivilege;
-      TokenPrivileges.Privileges[0].Attributes = SE_PRIVILEGE_REMOVED;
+	token_privileges.PrivilegeCount = 1;
+	token_privileges.Privileges[0].Luid = luid_debug;
+	token_privileges.Privileges[0].Attributes = SE_PRIVILEGE_REMOVED;
 
-      if (!AdjustTokenPrivileges(hToken, FALSE, &TokenPrivileges, 0, NULL, 0)) {
-         std::cout << "AdjustTokenPrivileges failed: " << GetLastError() << std::endl;
-         return false;
-      }
-   }
+	if (!AdjustTokenPrivileges(hToken, FALSE, &token_privileges, 0, NULL, 0)) {
+		std::cerr << "AdjustTokenPrivileges failed: " << GetLastError() << std::endl;
+		res = false;
+		goto cleanup;
+	}
 
-   return true;
+cleanup:
+	if (hToken)
+		CloseHandle(hToken);
+
+	return res;
 }
 
-struct handle_data {
-   unsigned long process_id;
-   HWND window_handle;
-};
+HWND find_game_main_window(DWORD game_pid) {
+	HWND hwnd = nullptr;
+	while ((hwnd = FindWindowExW(nullptr, hwnd, L"FFXIVGAME", nullptr))) {
+		DWORD pid;
+		GetWindowThreadProcessId(hwnd, &pid);
 
-BOOL CALLBACK enum_windows_callback(HWND handle, LPARAM lParam)
-{
-   handle_data& data = *(handle_data*)lParam;
-   unsigned long process_id = 0;
-   GetWindowThreadProcessId(handle, &process_id);
-   if (data.process_id != process_id)
-      return TRUE;
-   data.window_handle = handle;
-   return FALSE;
+		if (pid == game_pid)
+			break;
+	}
+	return hwnd;
 }
 
-bool has_window(unsigned long process_id)
-{
-   handle_data data;
-   data.process_id = process_id;
-   data.window_handle = 0;
-   EnumWindows(enum_windows_callback, (LPARAM)&data);
-   return data.window_handle != nullptr;
+int launch_game(const wchar_t* app, int argc, const wchar_t* const* argv) {
+	std::vector<void*> local_free_targets;
+
+	int res = -1;
+	DWORD err = 0;
+	EXPLICIT_ACCESS explicit_access{};
+	PACL new_acl{}, my_acl{};
+	SECURITY_DESCRIPTOR new_descriptor{};
+	PSECURITY_DESCRIPTOR my_descriptor{};
+	STARTUPINFO si{ sizeof si };
+	PROCESS_INFORMATION pi{};
+	SECURITY_ATTRIBUTES security_attributes{ sizeof security_attributes };
+	security_attributes.lpSecurityDescriptor = &new_descriptor;
+
+	std::wstring args;
+	append_quoted_argv(app, args, true);
+	for (int i = 0; i < argc; i++) {
+		args.push_back(L' ');
+		append_quoted_argv(argv[i], args);
+	}
+
+	std::wstring username;
+	{
+		DWORD size = UNLEN + 1;
+		username.resize(size, L'\0');
+		if (!GetUserName(&username[0], &size)) {
+			std::cerr << "GetUserName failed: " << GetLastError() << std::endl;
+			goto cleanup;
+		}
+		username.resize(size);
+	}
+
+	BuildExplicitAccessWithName(&explicit_access, &username[0], 0x001fffdf, GRANT_ACCESS, 0);
+
+	if (ERROR_SUCCESS != (err = SetEntriesInAcl(1u, &explicit_access, nullptr, &new_acl))) {
+		std::cerr << "SetEntriesInAcl failed: " << err << std::endl;
+		goto cleanup;
+	}
+	local_free_targets.push_back(new_acl);
+
+	if (!InitializeSecurityDescriptor(&new_descriptor, 1u)) {
+		std::cerr << "InitializeSecurityDescriptor failed: " << GetLastError() << std::endl;
+		goto cleanup;
+	}
+
+	if (!SetSecurityDescriptorDacl(&new_descriptor, true, new_acl, false)) {
+		std::cerr << "SetSecurityDescriptorDacl failed: " << GetLastError() << std::endl;
+		goto cleanup;
+	}
+
+	if (!CreateProcess(app, &args[0], &security_attributes, nullptr, false, 0x20, nullptr, nullptr, &si, &pi)) {
+		std::cerr << "CreateProcess failed: " << GetLastError() << std::endl;
+		goto cleanup;
+	}
+
+	while (!find_game_main_window(pi.dwProcessId))
+		Sleep(10);
+
+	if (ERROR_SUCCESS != (err = GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &my_acl, nullptr, &my_descriptor))) {
+		std::cerr << "GetSecurityInfo failed: " << err << std::endl;
+		goto cleanup;
+	}
+	local_free_targets.push_back(my_descriptor);
+
+	if (ERROR_SUCCESS != (SetSecurityInfo(pi.hProcess, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, my_acl, nullptr))) {
+		std::cerr << "SetSecurityInfo failed: " << err << std::endl;
+		goto cleanup;
+	}
+
+	res = static_cast<int>(pi.dwProcessId);
+
+cleanup:
+	if (pi.hProcess)
+		CloseHandle(pi.hProcess);
+	if (pi.hThread)
+		CloseHandle(pi.hThread);
+
+	for (auto& local_free_target : local_free_targets)
+		LocalFree(local_free_target);
+
+	return res;
 }
 
-int launch_game(char* appC, char* argC)
-{
-   std::string app(appC);
-   std::string arg(argC);
+int wmain(int argc, wchar_t** argv) {
+	if (argc < 2) {
+		std::wcerr << L"usage example: " << argv[0] << L" path/to/ffxiv_dx11.exe DEV.TestSID=0 ..." << std::endl;
+		return -1;
+	}
 
-   //Prepare CreateProcess args
-   std::wstring app_w(app.length(), L' '); // Make room for characters
-   std::copy(app.begin(), app.end(), app_w.begin()); // Copy string to wstring.
+	if (!disable_debug_privilege())
+		return -1;
 
-   std::wstring arg_w(arg.length(), L' '); // Make room for characters
-   std::copy(arg.begin(), arg.end(), arg_w.begin()); // Copy string to wstring.
+	int pid = launch_game(argv[1], argc - 2, &argv[2]);
+	if (pid == -1)
+		return -1;
 
-   std::wstring input = app_w + L" " + arg_w;
-   wchar_t* arg_concat = const_cast<wchar_t*>(input.c_str());
-   const wchar_t* app_const = app_w.c_str();
-
-   TCHAR username[256];
-   DWORD size = 256;
-   if (!GetUserName((TCHAR*)username, &size))
-   {
-      std::cout << "GetUserName failed: " << GetLastError() << std::endl;
-      return -1;
-   }
-
-   EXPLICIT_ACCESS pExplicitAccess;
-   ZeroMemory(&pExplicitAccess, sizeof(pExplicitAccess));
-   BuildExplicitAccessWithName(&pExplicitAccess, username, 0x001fffdf, GRANT_ACCESS, 0);
-
-   PACL NewAcl;
-   SetEntriesInAcl(1u, &pExplicitAccess, nullptr, &NewAcl);
-
-   SECURITY_DESCRIPTOR secDes;
-   ZeroMemory(&secDes, sizeof(secDes));
-   if (!InitializeSecurityDescriptor(&secDes, 1u))
-   {
-      std::cout << "InitializeSecurityDescriptor failed: " << GetLastError() << std::endl;
-      return -1;
-   }
-
-   if (!SetSecurityDescriptorDacl(&secDes, true, NewAcl, false))
-   {
-      std::cout << "SetSecurityDescriptorDacl failed: " << GetLastError() << std::endl;
-      return -1;
-   }
-
-   STARTUPINFO si;
-   PROCESS_INFORMATION pi;
-
-   ZeroMemory(&si, sizeof(si));
-   si.cb = sizeof(si);
-   ZeroMemory(&pi, sizeof(pi));
-
-   SECURITY_ATTRIBUTES pSec;
-   ZeroMemory(&pSec, sizeof(pSec));
-   pSec.nLength = sizeof(pSec);
-   pSec.lpSecurityDescriptor = &secDes;
-   pSec.bInheritHandle = false;
-
-   if (!CreateProcess(nullptr, arg_concat, &pSec, nullptr, false, 0x20, nullptr, nullptr, &si, &pi))
-   {
-      std::cout << "CreateProcess failed: " << GetLastError() << std::endl;
-      return -1;
-   }
-   
-
-   while (!has_window(pi.dwProcessId))
-   {
-      Sleep(10);
-   }
-
-   PACL myAcl;
-   auto gsi = GetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &myAcl, nullptr, nullptr);
-   if (gsi != ERROR_SUCCESS)
-   {
-      std::cout << "GetSecurityInfo failed: " << gsi << std::endl;
-      return -1;
-   }
-
-   auto ssi = SetSecurityInfo(pi.hProcess, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, myAcl, nullptr);
-   if (ssi != ERROR_SUCCESS)
-   {
-      std::cout << "SetSecurityInfo failed: " << ssi << std::endl;
-      return -1;
-   }
-
-   CloseHandle(pi.hProcess);
-   CloseHandle(pi.hThread);
-
-   return pi.dwProcessId;
+	std::cerr << "Game PID: " << pid << std::endl;
+	return pid;
 }
 
-int wmain(int argc, char* argv[])
-{
-   if (argc < 3)
-   {
-      std::cout << "needs game and arguments";
-      return -1;
-   }
+// https://docs.microsoft.com/en-us/archive/blogs/twistylittlepassagesallalike/everyone-quotes-command-line-arguments-the-wrong-way
+void append_quoted_argv(const std::wstring& arg, std::wstring& cmdline, bool force_escape) {
+	//
+	// Unless we're told otherwise, don't quote unless we actually
+	// need to do so --- hopefully avoid problems if programs won't
+	// parse quotes properly
+	//
 
-   disable_debug_privilege();
+	if (force_escape == false &&
+		arg.empty() == false &&
+		arg.find_first_of(L" \t\n\v\"") == arg.npos) {
+		cmdline.append(arg);
+	} else {
+		cmdline.push_back(L'"');
 
-   auto pid = launch_game(argv[1], argv[2]);
+		for (auto it = arg.begin(); ; ++it) {
+			unsigned backslash_count = 0;
 
-   std::cout << pid;
+			while (it != arg.end() && *it == L'\\') {
+				++it;
+				++backslash_count;
+			}
 
-   return pid;
+			if (it == arg.end()) {
+
+				//
+				// Escape all backslashes, but let the terminating
+				// double quotation mark we add below be interpreted
+				// as a metacharacter.
+				//
+
+				cmdline.append(backslash_count * 2, L'\\');
+				break;
+			} else if (*it == L'"') {
+
+				//
+				// Escape all backslashes and the following
+				// double quotation mark.
+				//
+
+				cmdline.append(backslash_count * 2 + 1, L'\\');
+				cmdline.push_back(*it);
+			} else {
+
+				//
+				// Backslashes aren't special here.
+				//
+
+				cmdline.append(backslash_count, L'\\');
+				cmdline.push_back(*it);
+			}
+		}
+
+		cmdline.push_back(L'"');
+	}
 }
